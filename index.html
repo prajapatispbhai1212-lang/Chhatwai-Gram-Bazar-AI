@@ -1,0 +1,101 @@
+from pathlib import Path
+import zipfile, shutil
+
+base = Path("/mnt/data/gram-bazar-complete-mvp")
+if base.exists():
+    shutil.rmtree(base)
+base.mkdir(parents=True)
+with zipfile.ZipFile("/mnt/data/gram-bazar-starter.zip") as z:
+    z.extractall(base)
+
+def put(path, content):
+    p = base / path
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content.strip() + "\n", encoding="utf-8")
+
+put("lib/auth.ts", r'''
+import { cookies } from "next/headers";
+import { SignJWT, jwtVerify } from "jose";
+import { prisma } from "@/lib/prisma";
+const COOKIE = "gram_bazar_session";
+function key() {
+  const value = process.env.SESSION_SECRET;
+  if (!value || value.length < 32) throw new Error("SESSION_SECRET must be 32+ characters");
+  return new TextEncoder().encode(value);
+}
+export async function createSession(user: {id:string;name:string;email:string;role:string}) {
+  const token = await new SignJWT({name:user.name,email:user.email,role:user.role})
+    .setProtectedHeader({alg:"HS256"}).setSubject(user.id).setIssuedAt().setExpirationTime("7d").sign(key());
+  (await cookies()).set(COOKIE, token, {httpOnly:true,secure:process.env.NODE_ENV==="production",sameSite:"lax",path:"/",maxAge:604800});
+}
+export async function clearSession() {
+  (await cookies()).set(COOKIE,"",{httpOnly:true,secure:process.env.NODE_ENV==="production",sameSite:"lax",path:"/",maxAge:0});
+}
+export async function currentUser() {
+  try {
+    const token=(await cookies()).get(COOKIE)?.value;
+    if(!token)return null;
+    const {payload}=await jwtVerify(token,key());
+    if(!payload.sub)return null;
+    return await prisma.user.findUnique({where:{id:payload.sub},select:{id:true,name:true,email:true,role:true}});
+  } catch { return null; }
+}
+export async function requireRole(roles:string[]) {
+  const user=await currentUser();
+  if(!user)return {error:"Login required",status:401 as const};
+  if(!roles.includes(user.role))return {error:"Forbidden",status:403 as const};
+  return {user};
+}
+''')
+put("app/api/v1/auth/register/route.ts", r'''
+import {NextRequest,NextResponse} from "next/server";
+import {z} from "zod";
+import bcrypt from "bcryptjs";
+import {prisma} from "@/lib/prisma";
+import {createSession} from "@/lib/auth";
+const schema=z.object({name:z.string().trim().min(2).max(80),email:z.string().email().max(190),password:z.string().min(10).max(100)});
+export async function POST(req:NextRequest){
+ const p=schema.safeParse(await req.json().catch(()=>null));
+ if(!p.success)return NextResponse.json({error:"Name, valid email and password (10+ characters) required"},{status:400});
+ try{
+  const user=await prisma.user.create({data:{name:p.data.name,email:p.data.email.toLowerCase(),passwordHash:await bcrypt.hash(p.data.password,12)},select:{id:true,name:true,email:true,role:true}});
+  await createSession(user); return NextResponse.json({user},{status:201});
+ }catch(e:any){return NextResponse.json({error:e?.code==="P2002"?"Email already registered":"Registration failed"},{status:e?.code==="P2002"?409:500});}
+}
+''')
+put("app/api/v1/auth/login/route.ts", r'''
+import {NextRequest,NextResponse} from "next/server";
+import {z} from "zod";
+import bcrypt from "bcryptjs";
+import {prisma} from "@/lib/prisma";
+import {createSession} from "@/lib/auth";
+const schema=z.object({email:z.string().email(),password:z.string().min(1).max(100)});
+export async function POST(req:NextRequest){
+ const p=schema.safeParse(await req.json().catch(()=>null));
+ if(!p.success)return NextResponse.json({error:"Invalid email or password"},{status:400});
+ const user=await prisma.user.findUnique({where:{email:p.data.email.toLowerCase()}});
+ if(!user||!(await bcrypt.compare(p.data.password,user.passwordHash)))return NextResponse.json({error:"Invalid email or password"},{status:401});
+ await createSession(user); return NextResponse.json({user:{id:user.id,name:user.name,email:user.email,role:user.role}});
+}
+''')
+put("app/api/v1/auth/logout/route.ts", r'''
+import {NextResponse} from "next/server";
+import {clearSession} from "@/lib/auth";
+export async function POST(){await clearSession();return NextResponse.json({ok:true});}
+''')
+put("app/api/v1/auth/me/route.ts", r'''
+import {NextResponse} from "next/server";
+import {currentUser} from "@/lib/auth";
+export async function GET(){const user=await currentUser();return user?NextResponse.json({user}):NextResponse.json({user:null},{status:401});}
+''')
+put("app/api/v1/cart/route.ts", r'''
+import {NextRequest,NextResponse} from "next/server";
+import {z} from "zod";
+import {prisma} from "@/lib/prisma";
+import {currentUser} from "@/lib/auth";
+export async function GET(){
+ const user=await currentUser();if(!user)return NextResponse.json({error:"Login required"},{status:401});
+ return NextResponse.json({data:await prisma.cartItem.findMany({where:{userId:user.id},include:{product:true}})});
+}
+const schema=z.object({productId:z.string().min(1),quantity:z.coerce.number().int().min(1).max(99)});
+export async function POST(req
